@@ -3,6 +3,7 @@ package crypt
 import (
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/mr-tron/base58"
@@ -17,18 +18,26 @@ const (
 )
 
 type (
-	// Key is a public or private encryption key
-	Key [KeySize]byte
-	// A KeyPair is a public, private key pair
-	KeyPair struct {
-		Public, Private Key
-	}
-	// Nonce is a number used once
-	Nonce = [NonceSize]byte
+	// PrivateKey is a private encryption key
+	PrivateKey [KeySize * 2]byte
 )
 
-// NewKey creates a new key from a base58 string
-func NewKey(str string) (key Key, err error) {
+// Generate generates a new PrivateKey.
+func Generate() (PrivateKey, error) {
+	var key PrivateKey
+
+	pub, priv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		return key, err
+	}
+
+	copy(key[:], priv[:])
+	copy(key[KeySize:], pub[:])
+	return key, nil
+}
+
+// NewKey creates a new key from a base58 string.
+func NewPrivateKey(str string) (key PrivateKey, err error) {
 	bs, err := base58.Decode(str)
 	if err != nil {
 		return key, err
@@ -40,70 +49,129 @@ func NewKey(str string) (key Key, err error) {
 	return key, nil
 }
 
-func (key Key) Valid() bool {
-	return [KeySize]byte(key) != [KeySize]byte{}
+// Decrypt decrypts data that was encrypted via a private key. The peer's public key is sent along with the data.
+func (key PrivateKey) Decrypt(data []byte) (PublicKey, []byte, error) {
+	var priv [KeySize]byte
+	copy(priv[:], key[:])
+
+	if len(data) < KeySize {
+		return PublicKey{}, nil, fmt.Errorf("invalid message: expected public key")
+	}
+
+	var pub [KeySize]byte
+	copy(pub[:], data[:])
+	data = data[KeySize:]
+
+	if len(data) < NonceSize {
+		return pub, nil, fmt.Errorf("invalid message: expected nonce")
+	}
+
+	var nonce [NonceSize]byte
+	copy(nonce[:], data[:])
+	data = data[NonceSize:]
+
+	opened, ok := box.Open(nil, data, &nonce, &pub, &priv)
+	if !ok {
+		return pub, nil, fmt.Errorf("invalid message: nacl box open failed")
+	}
+
+	return pub, opened, nil
 }
 
-func (key Key) String() string {
+// Encrypt encrypts data using the private key intended for the peer public key.
+func (key PrivateKey) Encrypt(peersPublicKey PublicKey, data []byte) []byte {
+	var priv [KeySize]byte
+	copy(priv[:], key[:KeySize])
+
+	var pub [KeySize]byte
+	copy(pub[:], peersPublicKey[:])
+
+	nonce := generateNonce()
+	sealed := box.Seal(nil, data, &nonce, &pub, &priv)
+
+	result := make([]byte, 0, len(pub)+len(nonce)+len(sealed))
+	result = append(result, key[KeySize:]...)
+	result = append(result, nonce[:]...)
+	result = append(result, sealed...)
+	return result
+}
+
+func (key PrivateKey) PublicKey() PublicKey {
+	var pub PublicKey
+	copy(pub[:], key[KeySize:])
+	return pub
+}
+
+// String returns the base58 encoded representation of the private key.
+func (key PrivateKey) String() string {
 	return base58.Encode(key[:])
 }
 
-func (key Key) MarshalYAML() (interface{}, error) {
+// MarshalYAML marshales the key for use in a YAML file.
+func (key PrivateKey) MarshalYAML() (interface{}, error) {
 	return key.String(), nil
 }
 
-func (key *Key) UnmarshalYAML(unmarshal func(interface{}) error) error {
+// UnmarshalYAML unmarshales the key from a YAML file.
+func (key *PrivateKey) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	var str string
 	err := unmarshal(&str)
 	if err != nil {
 		return err
 	}
-	*key, err = NewKey(str)
+	*key, err = NewPrivateKey(str)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-// GenerateKeyPair generates a (public, private) encryption key
-func GenerateKeyPair() KeyPair {
-	pub, priv, err := box.GenerateKey(rand.Reader)
+type (
+	// PublicKey is a public encryption key
+	PublicKey [KeySize]byte
+)
+
+// NewKey creates a new key from a base58 string.
+func NewPublicKey(str string) (key PublicKey, err error) {
+	bs, err := base58.Decode(str)
 	if err != nil {
-		panic(err)
+		return key, err
 	}
-	return KeyPair{Public: *pub, Private: *priv}
+	if len(bs) != KeySize {
+		return key, errors.New("invalid key")
+	}
+	copy(key[:], bs)
+	return key, nil
 }
 
-// Encrypt encrypts a message using a peer's public key and the local private key
-func (pair *KeyPair) Encrypt(peerPublicKey Key, data []byte) []byte {
-	nonce := generateNonce()
-	k1 := [KeySize]byte(peerPublicKey)
-	k2 := [KeySize]byte(pair.Private)
-	sealed := box.Seal(nil, data, &nonce, &k1, &k2)
-
-	var result []byte
-	result = append(result, nonce[:]...)
-	result = append(result, sealed...)
-	return result
+// String returns the base58 encoded public key.
+func (key PublicKey) String() string {
+	return base58.Encode(key[:])
 }
 
-// Decrypt decrypts a message using a peer's public key and the local private key
-func (pair *KeyPair) Decrypt(peerPublicKey Key, data []byte) ([]byte, error) {
-	if len(data) < NonceSize {
-		return nil, errors.New("invalid message")
-	}
-	var nonce Nonce
-	copy(nonce[:], data)
-	sealed := data[NonceSize:]
-	k1 := [KeySize]byte(peerPublicKey)
-	k2 := [KeySize]byte(pair.Private)
-	opened, ok := box.Open(nil, sealed, &nonce, &k1, &k2)
-	if !ok {
-		return nil, errors.New("invalid message")
-	}
-
-	return opened, nil
+// MarshalYAML marshals the public key for a YAML file.
+func (key PublicKey) MarshalYAML() (interface{}, error) {
+	return key.String(), nil
 }
+
+// UnmarshalYAML unmarshals the public key from a YAML file.
+func (key *PublicKey) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var str string
+	err := unmarshal(&str)
+	if err != nil {
+		return err
+	}
+	*key, err = NewPublicKey(str)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type (
+	// Nonce is a number used once.
+	Nonce = [NonceSize]byte
+)
 
 func generateNonce() Nonce {
 	var nonce Nonce
